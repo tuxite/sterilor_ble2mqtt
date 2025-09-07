@@ -1,0 +1,15 @@
+[mqtt]
+broker = "homeassistant.local"
+port = 1883
+topic = "sterilor"
+username = "sterilor"
+password = "ABCD12345678"
+
+[ble]
+serial_number = "0123-01234-012"
+pincode = 123
+notify_uuid="5325f281-6b80-4f9d-a1d0-3aefaf61467f"
+write_uuid="de2d4ba8-a0a8-4ab1-aeb4-5653b1615cf9"
+
+[ethernet]
+host = "SterilorPOE-GTW"

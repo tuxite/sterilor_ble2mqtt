@@ -1,0 +1,13 @@
+[build-system]
+requires = ["flit_core >=3.11,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "sterilor_ble2mqtt"
+authors = [{name = "Matthieu Morin", email = "tuxite@protonmail.com"}]
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+dynamic = ["version", "description"]
+
+[project.urls]
+Home = "https://github.com/tuxite/sterilor_ble2mqtt"
