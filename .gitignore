@@ -210,4 +210,6 @@ __marimo__/
 # Project specific
 .flake8
 *.bin
+*.bak
 config.toml
+sterilor_evo
