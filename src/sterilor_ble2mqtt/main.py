@@ -82,7 +82,7 @@ def ensure_discovery_payloads():
         print("Discovery payloads file found.")
     except OSError:
         print("Discovery payloads file not found — generating...")
-        from ha_discovery import write_discovery_file
+        from sterilor_evo.ha_discovery import write_discovery_file
         serial = config["ble"]["serial_number"]
         avail = "sterilor/" + serial + "/availability"
         state = "sterilor/" + serial + "/state"
