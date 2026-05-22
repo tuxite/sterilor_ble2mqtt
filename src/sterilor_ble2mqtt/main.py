@@ -9,7 +9,6 @@ import aioble
 import gc
 import sys
 from umqtt.robust import MQTTClient
-from sterilor_evo.frame import Frame
 
 
 # --- Load TOML Configuration ---
@@ -52,43 +51,49 @@ HA_DISCOVERY_PAYLOAD_FILE = "discovery_payloads.txt"
 # Loading parsers.py at module level consumes ~54 KB of heap, which prevents
 # NimBLE from allocating its contiguous initialisation block.
 _FRAMES_CACHE = None
+_FRAME_CACHE = None
+
+HEARTBEAT_INTERVAL = 30  # seconds
+
+# HomeAssistant MQTT discovery flag.
+# Allow the loop to send the HA_DISCOVERY_PAYLOAD_FILE payloads if file is readable.
+discovery_enabled = True
+
+
+def get_frame():
+    global _FRAME_CACHE
+    if _FRAME_CACHE is None:
+        from sterilor_evo.frame import Frame
+        _FRAME_CACHE = Frame
+    return _FRAME_CACHE()
 
 
 def get_frames():
     """Return frame class registry, loading it on first call."""
     global _FRAMES_CACHE
     if _FRAMES_CACHE is None:
-        from sterilor_evo.utils import get_frames_classes_by_name
-        _FRAMES_CACHE = get_frames_classes_by_name()
+        from sterilor_evo.parsers import Parser
+        Parser._build_registry()
+        _FRAMES_CACHE = Parser.get_by_name()
     return _FRAMES_CACHE
 
 
-HEARTBEAT_INTERVAL = 30  # seconds
+def ensure_payloads():
+    """Generate payload files if either is missing.
 
-
-def ensure_discovery_payloads():
-    """Generate discovery_payloads.txt if not present on the filesystem.
-
-    Imports ha_discovery only when the file is missing — keeping it out of
-    the normal import chain prevents heap fragmentation before BLE stack
-    initialisation (NimBLE requires a large contiguous allocation).
-
-    After generation, the device resets immediately so the next boot starts
-    with a clean heap — simpler and more reliable than trying to unload the
-    module and reclaim fragmented memory at runtime.
+    Both files are generated in a single pass via generate_payloads.py,
+    then the device resets so the next boot starts with a clean,
+    unfragmented heap — required for NimBLE stack initialisation.
     """
+    global discovery_enabled
     try:
         open(HA_DISCOVERY_PAYLOAD_FILE).close()
-        print("Discovery payloads file found.")
     except OSError:
-        print("Discovery payloads file not found — generating...")
-        from sterilor_evo.ha_discovery import write_discovery_file
-        serial = config["ble"]["serial_number"]
-        avail = "sterilor/" + serial + "/availability"
-        state = "sterilor/" + serial + "/state"
-        write_discovery_file(serial, avail, state)
-        print("Discovery payloads generated — rebooting...")
-        machine.reset()
+        discovery_enabled = False
+
+    if discovery_enabled:
+        print("MQTT Discovery file found.")
+        return
 
 
 def init_ethernet():
@@ -123,7 +128,7 @@ class MQTTHandler:
         """Publish HA discovery payloads line by line from pre-generated file.
 
         Reads one line at a time to avoid loading all payloads simultaneously
-        into RAM — each payload (~2.5 KB) is published and discarded before
+        into RAM — each payload (up to 10 KB) is published and discarded before
         the next one is read.
         """
         try:
@@ -151,6 +156,7 @@ class MQTTHandler:
             gc.collect()
 
     async def connect(self, delay=1, max_delay=120):
+        global discovery_enabled
         self.busy = True
         try:
             while True:
@@ -178,7 +184,8 @@ class MQTTHandler:
 
                     # Publish availability then schedule discovery as background task
                     self._publish_raw(MQTT_TOPIC_AVAIL, "online", retain=True)
-                    asyncio.create_task(self.publish_discovery())
+                    if discovery_enabled:
+                        asyncio.create_task(self.publish_discovery())
                     return
 
                 except Exception as e:
@@ -200,7 +207,8 @@ class MQTTHandler:
             if not cls:
                 print("Unknown frame:", data["name"])
                 return
-            fr = Frame()
+
+            fr = get_frame()
             payload = fr.create(cls.code, data=data.get("payload", {}))
             asyncio.create_task(ble.write(payload))
         except Exception as e:
@@ -295,6 +303,13 @@ class BLEHandler:
                     self.connected = True
                     # BLE connectivity is reflected via the global availability topic
                     mqtt.publish_availability("online")
+                    # Send PIN immediately after each BLE connection
+                    get_frames()  # Ensure the Parser by_code dict is populated
+                    fr = get_frame()
+                    print("Sending pincode...")
+                    await self.write(fr.create("000a", {
+                        "pincode": int(config["ble"]["pincode"])
+                    }))
                     return
 
                 except Exception as e:
@@ -318,18 +333,20 @@ class BLEHandler:
 
     async def _notification_loop(self):
         """Receive BLE notifications and publish to MQTT by frame name."""
+        fr = get_frame()
         while self.connected and self.notify_char:
+            gc.collect()
             try:
                 data = await self.notify_char.notified()
-                fr = Frame()
                 result = fr.read(data)
                 if result is None:
                     continue
                 frame_name, payload = result
-                topic = MQTT_TOPIC_STATE + "/" + frame_name
+                topic = "{0}/{1}".format(MQTT_TOPIC_STATE, frame_name)
                 mqtt.publish(topic, json.dumps(payload), retain=True)
             except NotImplementedError as e:
                 print("Frame not implemented:", e)
+                print("Raw data:", ubinascii.hexlify(data))
             except Exception as e:
                 print("BLE notif error:", e)
                 self.connected = False
@@ -373,43 +390,35 @@ async def monitor_tasks():
 
 
 async def heartbeat_task():
-    """Refresh availability topic to prevent HA from marking device unavailable."""
     while True:
         gc.collect()
+        free = gc.mem_free()
         if mqtt.connected and ble.connected:
             mqtt.publish_availability("online")
+            mqtt.publish(
+                "sterilor/{0}/debug/heap".format(SERIAL),
+                str(free), retain=False)
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
 async def main():
     init_ethernet()
 
-    # Generate HA discovery payloads file if missing.
-    # Must run before BLE init: ha_discovery import fragments the heap,
-    # and NimBLE requires a large contiguous block to initialise.
-    # The module is unloaded immediately after generation (see ensure_discovery_payloads).
-    ensure_discovery_payloads()
+    # Check if a HA MQTT discovery file is loaded and store the status (bool).
+    ensure_payloads()
 
     asyncio.create_task(mqtt.connect())
     await asyncio.sleep(5)  # let MQTT establish before BLE scan starts
-
     gc.collect()
+
     asyncio.create_task(ble.connect())
     asyncio.create_task(monitor_tasks())
     asyncio.create_task(heartbeat_task())
 
-    # Send PIN as soon as BLE is available
-    fr = Frame()
-    while True:
-        if ble.connected:
-            await ble.write(fr.create("000a", {"pincode": int(config["ble"]["pincode"])}))
-            break
-        await asyncio.sleep(2)
-
+    print("Full init OK")
     while True:
         await asyncio.sleep(10)
 
